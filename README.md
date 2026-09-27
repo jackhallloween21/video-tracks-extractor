@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icon.png" width="96" alt="Stream Extractor icon">
+  <img src="assets/loading-file.png" width="96" alt="Stream Extractor icon">
 </p>
 
 <h1 align="center">Stream Extractor</h1>
