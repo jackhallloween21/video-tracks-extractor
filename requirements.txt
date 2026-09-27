@@ -1,0 +1,11 @@
+# Core GUI (tkinter) ships with standard Python on Windows/macOS.
+# On Linux you may need your distro's tk package, e.g.:
+#   sudo apt install python3-tk
+
+# Optional: enables dragging a video file onto the window.
+# The app runs fine without it - it just falls back to "Open file...".
+tkinterdnd2>=0.3.0
+
+# Only needed for building the standalone .exe yourself; not required
+# to just run stream_extractor.py with a normal Python install.
+pyinstaller>=6.0.0
