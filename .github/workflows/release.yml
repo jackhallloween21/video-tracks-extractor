@@ -32,8 +32,8 @@ jobs:
         run: >
           pyinstaller --onefile --windowed
           --name StreamExtractor
-          --icon assets\icon.ico
-          --add-data "assets\icon.ico;assets"
+          --icon assets\icon2.ico
+          --add-data "assets\icon2.ico;assets"
           stream_extractor.py
 
       - name: Verify the exe was produced

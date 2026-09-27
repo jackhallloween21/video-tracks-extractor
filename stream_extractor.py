@@ -28,7 +28,10 @@ import sys
 import tempfile
 import threading
 import queue
+import urllib.error
+import urllib.request
 import webbrowser
+import zipfile
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -42,6 +45,47 @@ except Exception:
 APP_TITLE = "Stream Extractor (ffmpeg GUI)"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".stream_extractor_config.json")
 FFMPEG_DOWNLOAD_URL = "https://ffmpeg.org/download.html"
+
+# Static Windows builds of ffmpeg (zip). Tried in order; each contains
+# bin/ffmpeg.exe + bin/ffprobe.exe. Downloaded straight into
+# FFMPEG_LOCAL_DIR so no browser is needed.
+FFMPEG_BUILD_URLS = [
+    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+    "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/"
+    "ffmpeg-master-latest-win64-gpl.zip",
+]
+FFMPEG_LOCAL_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+    "StreamExtractor", "ffmpeg")
+
+# ---------------------------------------------------------------- console ---
+# A --windowed (PyInstaller) build has no console of its own, but every
+# child process we spawn (ffmpeg, ffprobe) is a console app - Windows
+# would give each of them a fresh console window, which pops up a black
+# terminal over the GUI. CREATE_NO_WINDOW (+ a hidden startupinfo) stops
+# that while still letting us read the pipes.
+if sys.platform == "win32":
+    _HIDDEN_PROCESS = {
+        "startupinfo": subprocess.STARTUPINFO(),
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+    }
+    _HIDDEN_PROCESS["startupinfo"].dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    _HIDDEN_PROCESS["startupinfo"].wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+else:
+    _HIDDEN_PROCESS = {}
+
+
+def run_quiet(cmd, **kwargs):
+    """subprocess.run that never flashes a console window on Windows."""
+    kwargs.setdefault("stdout", subprocess.DEVNULL)
+    kwargs.setdefault("stderr", subprocess.DEVNULL)
+    return subprocess.run(cmd, **_HIDDEN_PROCESS, **kwargs)
+
+
+def popen_quiet(cmd, **kwargs):
+    """subprocess.Popen that never flashes a console window on Windows."""
+    return subprocess.Popen(cmd, **_HIDDEN_PROCESS, **kwargs)
+
 
 # Embedded app icon (PNG, base64) so the window/taskbar icon works
 # identically whether this runs as a raw script or a frozen .exe -
@@ -190,8 +234,7 @@ def tool_works(path):
     if not path:
         return False
     try:
-        subprocess.run([path, "-version"], stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL, check=True)
+        run_quiet([path, "-version"], check=True)
         return True
     except Exception:
         return False
@@ -211,6 +254,96 @@ def resolve_tool(configured_path, tool_name):
     if on_path and tool_works(on_path):
         return on_path
     return ""
+
+
+def local_ffmpeg_build():
+    """(ffmpeg, ffprobe) of a build this app downloaded earlier, if usable."""
+    ffmpeg = os.path.join(FFMPEG_LOCAL_DIR, "ffmpeg" + EXE_SUFFIX)
+    ffprobe = os.path.join(FFMPEG_LOCAL_DIR, "ffprobe" + EXE_SUFFIX)
+    if tool_works(ffmpeg) and tool_works(ffprobe):
+        return ffmpeg, ffprobe
+    return "", ""
+
+
+def _download_to(url, dest_path, progress):
+    """Stream url to dest_path, reporting (done_bytes, total_bytes|None)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "StreamExtractor/1.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp, open(dest_path, "wb") as out:
+        total = resp.headers.get("Content-Length")
+        total = int(total) if total and total.isdigit() else None
+        done = 0
+        while True:
+            chunk = resp.read(256 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+            done += len(chunk)
+            progress("download", done, total)
+    return done
+
+
+def _tool_key(filename):
+    """'bin/FFMPEG.EXE' -> 'ffmpeg' (platform-independent basename match)."""
+    name = filename.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if EXE_SUFFIX and name.endswith(EXE_SUFFIX):
+        name = name[:-len(EXE_SUFFIX)]
+    return name
+
+
+def download_ffmpeg_build(progress):
+    """
+    Download a static ffmpeg build and unpack ffmpeg.exe + ffprobe.exe
+    into FFMPEG_LOCAL_DIR. Returns (ffmpeg_path, ffprobe_path).
+    progress(kind, ...) is called with:
+        ("download", done_bytes, total_bytes|None)
+        ("extract", done_bytes, total_bytes)
+    """
+    os.makedirs(FFMPEG_LOCAL_DIR, exist_ok=True)
+    last_error = None
+    for url in FFMPEG_BUILD_URLS:
+        zip_path = os.path.join(tempfile.gettempdir(), "stream_extractor_ffmpeg.zip")
+        try:
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+            _download_to(url, zip_path, progress)
+
+            with zipfile.ZipFile(zip_path) as zf:
+                candidates = [m for m in zf.infolist()
+                              if not m.is_dir() and _tool_key(m.filename) in ("ffmpeg", "ffprobe")]
+                # Prefer the copies that live in a bin/ folder (builds ship
+                # extras like ffplay/ffprobe under bin/, never elsewhere).
+                members = [m for m in candidates if "/bin/" in m.filename.replace("\\", "/").lower()]
+                members = members or candidates
+                targets = {}
+                total = sum(m.file_size for m in members) or 1
+                done = 0
+                for member in members:
+                    key = _tool_key(member.filename)
+                    if key in targets:
+                        continue
+                    target = os.path.join(FFMPEG_LOCAL_DIR, key + EXE_SUFFIX)
+                    with zf.open(member) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    targets[key] = target
+                    done += member.file_size
+                    progress("extract", done, total)
+            os.remove(zip_path)
+
+            ffmpeg = targets.get("ffmpeg", "")
+            ffprobe = targets.get("ffprobe", "")
+            if tool_works(ffmpeg) and tool_works(ffprobe):
+                return ffmpeg, ffprobe
+            last_error = "downloaded files could not be run"
+        except (urllib.error.URLError, urllib.error.HTTPError, zipfile.BadZipFile,
+                OSError, ValueError) as e:
+            last_error = str(e)
+        finally:
+            if os.path.exists(zip_path):
+                try:
+                    os.remove(zip_path)
+                except OSError:
+                    pass
+    raise RuntimeError(last_error or "all download sources failed")
 
 
 def human_audio_desc(stream):
@@ -322,25 +455,153 @@ class FfmpegSetupDialog(tk.Toplevel):
         self.result_ffprobe = ""
         self.grab_set()
         self.transient(parent)
+        self._queue = queue.Queue()
+        self._busy = False
 
         pad = {"padx": 16, "pady": 8}
         msg = reason or "ffmpeg / ffprobe could not be found on your system."
-        tk.Label(self, text=msg, wraplength=420, justify="left",
+        tk.Label(self, text=msg, wraplength=440, justify="left",
                  bg=palette["bg"], fg=palette["fg"]).pack(**pad)
-        tk.Label(self, bg=palette["bg"], fg=palette["muted"], wraplength=420, justify="left",
+        tk.Label(self, bg=palette["bg"], fg=palette["muted"], wraplength=440, justify="left",
                  text="This app needs ffmpeg (and ffprobe, which ships with it) "
-                      "to inspect and extract media streams.").pack(padx=16, pady=(0, 8))
+                      "to inspect and extract media streams. Download it right "
+                      "here, or point the app at a copy you already have.").pack(
+            padx=16, pady=(0, 10))
 
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", **pad)
-        ttk.Button(btns, text="Browse for ffmpeg executable...", command=self.browse).pack(fill="x", pady=4)
-        ttk.Button(btns, text="Open ffmpeg download page", command=self.open_download).pack(fill="x", pady=4)
-        ttk.Button(btns, text="I'll set this up later", command=self.skip).pack(fill="x", pady=(12, 0))
+        self.btns = ttk.Frame(self)
+        self.btns.pack(fill="x", **pad)
+        self._buttons = []
+
+        if sys.platform == "win32":
+            # Static Windows builds are downloaded straight from Python,
+            # so the user never has to leave the app.
+            self.download_btn = self._add_button(
+                self.btns, text=self._download_button_text(),
+                style="Accent.TButton", command=self.start_download)
+            self.download_btn.pack(fill="x", pady=4)
+        else:
+            self.download_btn = None
+        self.browse_btn = self._add_button(
+            self.btns, text="Browse for ffmpeg executable...", command=self.browse)
+        self.browse_btn.pack(fill="x", pady=4)
+        if sys.platform != "win32":
+            self._add_button(self.btns, text="Open ffmpeg download page",
+                             command=self.open_download).pack(fill="x", pady=4)
+        self._add_button(self.btns, text="I'll set this up later",
+                         command=self.skip).pack(fill="x", pady=(12, 0))
+
+        # Download progress (hidden until a download starts)
+        self.progress_frame = tk.Frame(self, bg=palette["bg"])
+        self.progress_bar = ttk.Progressbar(self.progress_frame, orient="horizontal",
+                                             mode="determinate", length=400)
+        self.progress_bar.pack(fill="x")
+        self.progress_label = tk.Label(self.progress_frame, text="", bg=palette["bg"],
+                                       fg=palette["muted"], wraplength=440, justify="left")
+        self.progress_label.pack(anchor="w", pady=(4, 0))
 
         self.protocol("WM_DELETE_WINDOW", self.skip)
         self.update_idletasks()
         self.geometry(f"+{parent.winfo_rootx()+40}+{parent.winfo_rooty()+40}")
+        self._poll_queue()
         self.wait_window(self)
+
+    def _add_button(self, parent, **kwargs):
+        btn = ttk.Button(parent, **kwargs)
+        self._buttons.append(btn)
+        return btn
+
+    def _set_buttons_enabled(self, enabled):
+        for btn in self._buttons:
+            btn.state(["!disabled"] if enabled else ["disabled"])
+
+    def _download_button_text(self):
+        ffmpeg, _ = local_ffmpeg_build()
+        if ffmpeg:
+            return "Use the ffmpeg downloaded earlier"
+        return "Download ffmpeg for me (~110 MB)"
+
+    # ---------------- downloading ----------------
+
+    def start_download(self):
+        if self._busy or self.download_btn is None:
+            return
+        ffmpeg, ffprobe = local_ffmpeg_build()
+        if ffmpeg:
+            # Already downloaded once - reuse it without re-downloading.
+            self.result_ffmpeg, self.result_ffprobe = ffmpeg, ffprobe
+            self.destroy()
+            return
+
+        self._busy = True
+        self._set_buttons_enabled(False)
+        self.progress_frame.pack(fill="x", padx=16, pady=(0, 12))
+        self.progress_label.configure(
+            text=f"Downloading ffmpeg into:\n{FFMPEG_LOCAL_DIR}")
+        self.progress_bar.configure(mode="indeterminate")
+        self.progress_bar.start(12)
+        threading.Thread(target=self._download_worker, daemon=True).start()
+
+    def _download_worker(self):
+        def on_progress(kind, done, total):
+            self._queue.put(("progress", kind, (done, total)))
+
+        try:
+            ffmpeg, ffprobe = download_ffmpeg_build(on_progress)
+            self._queue.put(("done", ffmpeg, ffprobe))
+        except Exception as e:  # noqa: BLE001 - surfaced to the user below
+            self._queue.put(("error", str(e), None))
+
+    def _poll_queue(self):
+        if not self.winfo_exists():
+            return
+        try:
+            while True:
+                kind, a, b = self._queue.get_nowait()
+                if kind == "progress":
+                    self._show_progress(a, *b)
+                elif kind == "done":
+                    self.result_ffmpeg, self.result_ffprobe = a, b
+                    self._busy = False
+                    self.destroy()
+                    return
+                elif kind == "error":
+                    self._busy = False
+                    self._reset_after_error(a)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+    def _show_progress(self, stage, done, total):
+        mb_done = done / (1024 * 1024)
+        if stage == "download":
+            if total:
+                self.progress_bar.stop()
+                self.progress_bar.configure(mode="determinate",
+                                            value=int(100 * done / total))
+                self.progress_label.configure(
+                    text=f"Downloading ffmpeg... {mb_done:.1f} / {total / (1024 * 1024):.1f} MB")
+            else:
+                self.progress_label.configure(
+                    text=f"Downloading ffmpeg... {mb_done:.1f} MB")
+        else:
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate",
+                                        value=int(100 * done / total))
+            self.progress_label.configure(
+                text=f"Unpacking... {mb_done:.1f} / {total / (1024 * 1024):.1f} MB")
+
+    def _reset_after_error(self, error):
+        self.progress_bar.stop()
+        self.progress_bar.configure(mode="determinate", value=0)
+        self.progress_label.configure(text=f"Download failed: {error}")
+        self._set_buttons_enabled(True)
+        if messagebox.askyesno(
+                "Download failed",
+                f"Could not download ffmpeg:\n{error}\n\n"
+                "Try again, or open the ffmpeg download page in your browser instead?"):
+            self.open_download()
+
+    # ---------------- manual / fallback ----------------
 
     def browse(self):
         filetypes = [("ffmpeg executable", f"ffmpeg{EXE_SUFFIX}"), ("All files", "*.*")]
@@ -369,10 +630,6 @@ class FfmpegSetupDialog(tk.Toplevel):
 
     def open_download(self):
         webbrowser.open(FFMPEG_DOWNLOAD_URL)
-        messagebox.showinfo("Download ffmpeg",
-                             "Opened the ffmpeg download page in your browser.\n\n"
-                             "After installing, click 'Browse for ffmpeg executable...' "
-                             "to point this app at it.")
 
     def skip(self):
         self.result_ffmpeg, self.result_ffprobe = "", ""
@@ -708,7 +965,8 @@ class ExtractorApp:
     def probe_file(self, path):
         cmd = [self.ffprobe_path.get(), "-v", "quiet", "-print_format", "json",
                "-show_format", "-show_streams", path]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                **_HIDDEN_PROCESS)
         if result.returncode != 0:
             raise RuntimeError(result.stderr.decode(errors="ignore"))
         return json.loads(result.stdout.decode(errors="ignore"))
@@ -939,8 +1197,8 @@ class ExtractorApp:
     def _run_with_progress(self, cmd, item_id, index, total):
         errfile = tempfile.TemporaryFile(mode="w+")
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile,
-                                     text=True, bufsize=1)
+            proc = popen_quiet(cmd, stdout=subprocess.PIPE, stderr=errfile,
+                               text=True, bufsize=1)
         except Exception as e:
             errfile.close()
             self.log(f"  FAILED to launch ffmpeg: {e}")
