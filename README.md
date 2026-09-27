@@ -27,8 +27,9 @@
   <img src="screenshots/main-light.png" width="49%" alt="Main window, light theme, streams loaded">
 </p>
 <p align="center">
-  <img src="screenshots/ffmpeg-setup.png" width="24.5%" alt="Built-in ffmpeg download / locate dialog">
-  <img src="screenshots/extracting.png" width="49%" alt="Extraction in progress with live progress bars and log">
+  <img src="screenshots/open-file.png" width="32%" alt="Open-file picker over the main window">
+  <img src="screenshots/ffmpeg-setup.png" width="32%" alt="Built-in ffmpeg download / locate dialog">
+  <img src="screenshots/extracting.png" width="32%" alt="Extraction in progress with live progress bars and log">
 </p>
 
 ---
